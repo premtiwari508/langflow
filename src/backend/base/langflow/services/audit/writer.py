@@ -98,7 +98,7 @@ def build_audit_event(draft: AuditEventDraft) -> AuditEvent:
         result=draft.result.value,
         error_code=draft.error_code.value if draft.error_code is not None else None,
         request_id=current_request_id(),
-        details=validate_details(draft.resource_type, draft.result, draft.details),
+        details=validate_details(draft.resource_type, draft.result, draft.details, draft.operation),
     )
 
 
@@ -133,17 +133,13 @@ def _slots() -> asyncio.Semaphore:
     return _write_slots
 
 
-async def record_audit_event_after_rollback(draft: AuditEventDraft) -> bool:
-    """Write a failure or denial in its own transaction; the caller's is gone.
+async def persist_audit_event_independently(
+    event: AuditEvent, *, timeout: float = INDEPENDENT_WRITE_TIMEOUT_SECONDS
+) -> bool:
+    """Insert an already built event in its own transaction, or raise.
 
-    Bounded to a few concurrent connections so a burst of refusals cannot drain
-    the pool its own requests need. The caller is already failing or denied, so
-    a storage outage is surfaced as an error log rather than a second exception.
-    An excluded action, denials included, is dropped before a connection is taken.
+    Returns ``False`` when there is no database, as under ``lfx serve``.
     """
-    if not is_audit_enabled() or not is_action_audited(draft.action):
-        return False
-    event = build_audit_event(draft)
 
     async def _write() -> bool:
         async with session_scope() as session:
@@ -155,21 +151,35 @@ async def record_audit_event_after_rollback(draft: AuditEventDraft) -> bool:
     # Queueing for a slot is not the write: only the write is on the clock, so a
     # burst does not spend another event's budget waiting in line.
     async with _slots():
-        try:
-            # wait_for rather than asyncio.timeout, which does not exist on Python 3.10.
-            return await asyncio.wait_for(_write(), timeout=INDEPENDENT_WRITE_TIMEOUT_SECONDS)
-        except Exception as exc:  # noqa: BLE001
-            # A timeout can fire after the COMMIT reached the database, so the row
-            # may exist: report it as unknown rather than as certain data loss.
-            outcome = "unknown" if isinstance(exc, asyncio.TimeoutError) else "not_persisted"
-            await logger.aerror(
-                "op=record_audit_event_after_rollback outcome=%s request_id=%s "
-                "resource_type=%s operation=%s result=%s error=%s",
-                outcome,
-                event.request_id,
-                event.resource_type,
-                event.operation,
-                event.result,
-                type(exc).__name__,
-            )
-            return False
+        # wait_for rather than asyncio.timeout, which does not exist on Python 3.10.
+        return await asyncio.wait_for(_write(), timeout=timeout)
+
+
+async def record_audit_event_after_rollback(draft: AuditEventDraft) -> bool:
+    """Write a failure or denial in its own transaction; the caller's is gone.
+
+    Bounded to a few concurrent connections so a burst of refusals cannot drain
+    the pool its own requests need. The caller is already failing or denied, so
+    a storage outage is surfaced as an error log rather than a second exception.
+    An excluded action, denials included, is dropped before a connection is taken.
+    """
+    if not is_audit_enabled() or not is_action_audited(draft.action):
+        return False
+    event = build_audit_event(draft)
+    try:
+        return await persist_audit_event_independently(event)
+    except Exception as exc:  # noqa: BLE001
+        # A timeout can fire after the COMMIT reached the database, so the row
+        # may exist: report it as unknown rather than as certain data loss.
+        outcome = "unknown" if isinstance(exc, asyncio.TimeoutError) else "not_persisted"
+        await logger.aerror(
+            "op=record_audit_event_after_rollback outcome=%s request_id=%s "
+            "resource_type=%s operation=%s result=%s error=%s",
+            outcome,
+            event.request_id,
+            event.resource_type,
+            event.operation,
+            event.result,
+            type(exc).__name__,
+        )
+        return False

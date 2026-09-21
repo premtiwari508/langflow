@@ -98,7 +98,7 @@ def build_audit_event(draft: AuditEventDraft) -> AuditEvent:
         result=draft.result.value,
         error_code=draft.error_code.value if draft.error_code is not None else None,
         request_id=current_request_id(),
-        details=validate_details(draft.resource_type, draft.result, draft.details, draft.operation),
+        details=validate_details(draft.resource_type, draft.result, draft.details),
     )
 
 
@@ -139,7 +139,7 @@ async def persist_audit_event_independently(
     """Insert an already built event in its own transaction, or raise.
 
     Returns ``False`` when the action is excluded or there is no database, as
-    under ``lfx serve``. Checked here too because run events arrive already built.
+    under ``lfx serve``.
     """
     if not is_action_audited(event.action):
         return False

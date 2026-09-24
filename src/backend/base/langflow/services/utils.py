@@ -15,7 +15,7 @@ from lfx.services.settings.constants import (
 from lfx.services.settings.feature_flags import FEATURE_FLAGS
 from sqlalchemy import delete
 from sqlalchemy import exc as sqlalchemy_exc
-from sqlmodel import col, select
+from sqlmodel import col, literal, select
 
 from langflow.services.cache.base import ExternalAsyncBaseCacheService
 from langflow.services.cache.factory import CacheServiceFactory
@@ -399,23 +399,28 @@ async def migrate_orphaned_mcp_servers_config(
         return True
 
 
-async def _rows_owned_by(session: AsyncSession, user_id) -> dict[str, int]:
-    """How many rows each table holds for this user, across every table that references ``user.id``."""
-    from sqlalchemy import func
+async def _tables_owned_by(session: AsyncSession, user_id) -> list[str]:
+    """The tables holding at least one row for this user, across everything referencing ``user.id``.
+
+    Which tables, not how many rows. Teardown runs on every startup and shutdown for as
+    long as this account exists, so this sits in front of the server coming up; counting
+    would read every matching row of tables that only grow, such as the audit log. One
+    indexed lookup per table that stops at the first row answers the question being asked.
+    """
     from sqlmodel import SQLModel
 
     import langflow.services.database.models  # noqa: F401 - importing registers every table on the metadata
 
-    owned: dict[str, int] = {}
+    owned: list[str] = []
     for table in SQLModel.metadata.sorted_tables:
         for foreign_key in table.foreign_keys:
             if foreign_key.column.table.name != "user" or foreign_key.column.name != "id":
                 continue
-            count = (
-                await session.exec(select(func.count()).select_from(table).where(foreign_key.parent == user_id))
-            ).one()
-            if count:
-                owned[table.name] = owned.get(table.name, 0) + count
+            statement = select(literal(1)).select_from(table).where(foreign_key.parent == user_id).limit(1)
+            if (await session.exec(statement)).first() is not None:
+                if table.name not in owned:
+                    owned.append(table.name)
+                break
     return owned
 
 
@@ -444,7 +449,7 @@ async def teardown_superuser(settings_service: SettingsService, session: AsyncSe
         if not user or user.is_superuser is not True or user.last_login_at:
             return
 
-        owned = await _rows_owned_by(session, user.id)
+        owned = await _tables_owned_by(session, user.id)
         if not owned:
             await session.delete(user)
             await logger.adebug("Default superuser removed successfully.")
@@ -460,7 +465,7 @@ async def teardown_superuser(settings_service: SettingsService, session: AsyncSe
                 user.password = auth.get_password_hash(password)
                 session.add(user)
                 await logger.awarning(
-                    f"Kept the default superuser '{DEFAULT_SUPERUSER}', which owns {owned}, "
+                    f"Kept the default superuser '{DEFAULT_SUPERUSER}', which owns rows in {', '.join(owned)}, "
                     "and set its password to the configured LANGFLOW_SUPERUSER_PASSWORD."
                 )
             return
@@ -476,7 +481,8 @@ async def teardown_superuser(settings_service: SettingsService, session: AsyncSe
         session.add(user)
         await logger.awarning(
             f"AUTO_LOGIN is off, so the default superuser '{DEFAULT_SUPERUSER}' can no longer sign in "
-            f"with its old password. It owns {owned}, so it was kept rather than deleted. Another "
+            f"with its old password. It owns rows in {', '.join(owned)}, so it was kept rather than deleted. "
+            f"Another "
             f"superuser can set a new password for it from the Admin page or PATCH /api/v1/users/{user.id}."
         )
     except Exception as exc:

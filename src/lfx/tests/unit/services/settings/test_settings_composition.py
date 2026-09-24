@@ -96,6 +96,7 @@ EXPECTED_FIELDS = {
     # StorageSettings
     "storage_type",
     "object_storage_bucket_name",
+    "object_storage_max_pool_connections",
     "object_storage_prefix",
     "object_storage_tags",
     # McpSettings

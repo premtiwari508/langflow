@@ -11,6 +11,7 @@ import contextlib
 import os
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any
+from weakref import WeakKeyDictionary
 
 from langflow.logging.logger import logger
 
@@ -53,16 +54,31 @@ class S3StorageService(StorageService):
 
         try:
             from aiobotocore.session import get_session
+            from botocore.config import Config
         except ImportError as exc:
             msg = "aiobotocore is required for S3 storage. Install it with: uv pip install aiobotocore"
             raise ImportError(msg) from exc
+
+        # A client owns a connection pool, so sharing one client shares its pool.
+        # botocore sizes that pool at 10, which was invisible while every call built
+        # a client of its own: concurrency was bounded by the caller, not by the pool.
+        # Operations beyond this many at once on one loop now wait for a connection.
+        self._client_config = Config(max_pool_connections=settings_service.settings.object_storage_max_pool_connections)
 
         # Create session - AWS credentials are picked up from environment variables
         self.session = get_session()
         # One client per event loop. A client is bound to the loop that made it, and
         # the service is reached from more than one: components running a loop of
         # their own, CLI paths behind asyncio.run.
-        self._clients: dict[asyncio.AbstractEventLoop, tuple[contextlib.AsyncExitStack, Any]] = {}
+        #
+        # Held weakly so this dict is not the thing keeping a finished loop alive. It
+        # is not on its own enough: an open client holds its transport, which holds
+        # the loop, so the entry outlives the loop until the sweep in _get_client
+        # drops it. The weak mapping covers the case where nothing else refers to the
+        # loop; the sweep covers the case where the client still does.
+        self._clients: WeakKeyDictionary[asyncio.AbstractEventLoop, tuple[contextlib.AsyncExitStack, Any]] = (
+            WeakKeyDictionary()
+        )
 
         self.set_ready()
         logger.info(
@@ -180,17 +196,23 @@ class S3StorageService(StorageService):
         loop = asyncio.get_running_loop()
         # A loop that has closed cannot use or close its client, so drop it.
         # ponytail: its connections are only released when garbage collected.
-        for closed in [other for other in self._clients if other.is_closed()]:
-            del self._clients[closed]
-        if loop not in self._clients:
+        for closed in [other for other in list(self._clients) if other.is_closed()]:
+            self._clients.pop(closed, None)
+        existing = self._clients.get(loop)
+        if existing is not None:
+            client = existing[1]
+        else:
             stack = contextlib.AsyncExitStack()
-            client = await stack.enter_async_context(self.session.create_client("s3"))
-            if loop in self._clients:
+            client = await stack.enter_async_context(self.session.create_client("s3", config=self._client_config))
+            if (won := self._clients.get(loop)) is not None:
                 # Another coroutine on this loop built one while this one awaited.
                 await stack.aclose()
+                client = won[1]
             else:
                 self._clients[loop] = (stack, client)
-        yield self._clients[loop][1]
+        # Yielded from a local: teardown can empty the mapping between here and the
+        # next statement, and this block still hands back the client it resolved.
+        yield client
 
     async def check_readiness(self) -> StorageReadiness:
         """Verify S3 credentials resolve and the configured bucket is reachable.
@@ -482,7 +504,7 @@ class S3StorageService(StorageService):
         loop is dropped, since closing it needs its own loop.
         """
         loop = asyncio.get_running_loop()
-        clients, self._clients = self._clients, {}
+        clients, self._clients = self._clients, WeakKeyDictionary()
         if (current := clients.get(loop)) is not None:
             await current[0].aclose()
         logger.info("S3 storage service teardown complete")

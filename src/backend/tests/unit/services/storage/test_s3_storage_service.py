@@ -8,7 +8,11 @@ the S3 backend with untrusted identifiers.
 Regression for GHSA-rcjh-r59h-gq37 (defense in depth at the S3 backend).
 """
 
+import asyncio
+import gc
+import threading
 from unittest.mock import AsyncMock, Mock
+from weakref import WeakKeyDictionary
 
 import pytest
 from langflow.services.storage.s3 import S3StorageService
@@ -22,6 +26,7 @@ def mock_settings_service(tmp_path):
     settings_service.settings.object_storage_bucket_name = "langflow-unit-test-bucket"
     settings_service.settings.object_storage_prefix = "test-prefix"
     settings_service.settings.object_storage_tags = {}
+    settings_service.settings.object_storage_max_pool_connections = 50
     return settings_service
 
 
@@ -58,7 +63,8 @@ async def test_get_client_builds_one_aiobotocore_client_per_loop(mock_session_se
     async with service._get_client() as first, service._get_client() as second:
         pass
 
-    session.create_client.assert_called_once_with("s3")
+    session.create_client.assert_called_once()
+    assert session.create_client.call_args.args == ("s3",)
     assert first is second is client
     # Leaving the block does not close it; teardown does.
     session.create_client.return_value.__aexit__.assert_not_called()
@@ -166,3 +172,73 @@ class TestS3BuildFullPathValidation:
 
     def test_build_full_path_accepts_legitimate_identifiers(self, s3_service_offline):
         assert s3_service_offline.build_full_path("legit_flow", "file.txt") == "test-prefix/legit_flow/file.txt"
+
+
+def _stub_session(client=None):
+    """A session whose create_client yields ``client`` and records how it was called."""
+    session = Mock()
+    session.create_client.return_value.__aenter__ = AsyncMock(return_value=client or object())
+    session.create_client.return_value.__aexit__ = AsyncMock(return_value=None)
+    return session
+
+
+async def test_the_shared_client_is_given_the_configured_pool_size(mock_session_service, mock_settings_service):
+    # One client per loop means one connection pool per loop. botocore sizes it at 10,
+    # so without this every operation past the tenth on a loop waits for a connection.
+    mock_settings_service.settings.object_storage_max_pool_connections = 37
+    service = S3StorageService(mock_session_service, mock_settings_service)
+    service.session = _stub_session()
+
+    async with service._get_client():
+        pass
+
+    config = service.session.create_client.call_args.kwargs["config"]
+    assert config.max_pool_connections == 37
+
+
+async def test_the_client_survives_a_teardown_that_lands_mid_build(mock_session_service, mock_settings_service):
+    """A teardown on another thread can swap the mapping between the store and the yield.
+
+    There is no await between those two statements, so this cannot be interleaved on one
+    loop; it is reachable only from a second thread running a loop of its own. The swap is
+    driven from ``__setitem__`` here to put it exactly in that window, deterministically.
+    """
+    service = S3StorageService(mock_session_service, mock_settings_service)
+    built = object()
+    service.session = _stub_session(built)
+
+    class SwapsOnStore(WeakKeyDictionary):
+        def __setitem__(self, key, value):
+            super().__setitem__(key, value)
+            # What teardown() does: the mapping this block stored into is no longer
+            # the one the service holds.
+            service._clients = WeakKeyDictionary()
+
+    service._clients = SwapsOnStore()
+
+    async with service._get_client() as resolved:
+        assert resolved is built
+
+
+def test_a_finished_loop_is_not_held_by_the_service(mock_session_service, mock_settings_service):
+    # The service must not be the reason a loop that is done with stays alive.
+    service = S3StorageService(mock_session_service, mock_settings_service)
+    service.session = _stub_session()
+
+    async def use_client():
+        async with service._get_client():
+            pass
+
+    def on_its_own_loop():
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(use_client())
+        finally:
+            loop.close()
+
+    thread = threading.Thread(target=on_its_own_loop)
+    thread.start()
+    thread.join()
+    gc.collect()
+
+    assert len(service._clients) == 0

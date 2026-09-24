@@ -458,11 +458,22 @@ class S3StorageService(StorageService):
         S3 sets the ETag to the MD5 of the body for a single-part upload. A multipart
         ETag is a hash of the part hashes and carries a ``-``, so it says nothing about
         the content and this returns None for it.
+
+        Raises:
+            FileNotFoundError: If the object does not exist, as ``get_file_size`` does.
         """
         self._validate_identifiers(flow_id, file_name)
         key = self.build_full_path(flow_id, file_name)
-        async with self._get_client() as s3_client:
-            response = await s3_client.head_object(Bucket=self.bucket_name, Key=key)
+        try:
+            async with self._get_client() as s3_client:
+                response = await s3_client.head_object(Bucket=self.bucket_name, Key=key)
+        except Exception as e:
+            # Same shape as get_file_size: a missing key is a FileNotFoundError, not a
+            # driver error, so a caller handles one absence the same way whichever it asked.
+            if hasattr(e, "response") and e.response.get("Error", {}).get("Code") in ["NoSuchKey", "404"]:
+                msg = f"File not found: {file_name}"
+                raise FileNotFoundError(msg) from e
+            raise
         etag = response.get("ETag", "").strip('"')
         return None if not etag or "-" in etag else etag
 

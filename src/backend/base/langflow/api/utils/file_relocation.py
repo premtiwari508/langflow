@@ -186,9 +186,10 @@ class FilePlan:
 async def plan_file(source: StorageService, target: StorageService, namespace: str, file_name: str) -> FilePlan:
     """Decide what to do with one file without writing anything.
 
-    Reads no bytes, except when the target already holds an object of the same size:
-    a file edited between runs can keep its length, so the content is compared where
-    the target gives a checksum cheaply.
+    Reads no bytes when both sides can name a checksum without opening the file. Only a
+    backend that would have to read it to answer, as local disk does, is read: a file
+    edited between runs can keep its length, so content is compared once size alone
+    cannot settle it.
     """
     key = target.build_full_path(namespace, file_name)
     size = await source.get_file_size(flow_id=namespace, file_name=file_name)
@@ -205,8 +206,14 @@ async def plan_file(source: StorageService, target: StorageService, namespace: s
     target_md5 = await target.get_file_md5(flow_id=namespace, file_name=file_name)
     if target_md5 is None:
         return FilePlan("skip", key, size, f"already in the target ({size} bytes, identity checked by size only)")
-    data = await source.get_file(flow_id=namespace, file_name=file_name)
-    if hashlib.md5(data).hexdigest() != target_md5:  # noqa: S324 - compared with S3's ETag, not a security use
+    # Ask the source for its own checksum first. A backend that already holds one answers
+    # without opening the file, so object storage on both sides settles this with two HEADs
+    # and no body. Only a backend that would have to read to answer returns None here.
+    source_md5 = await source.get_file_md5(flow_id=namespace, file_name=file_name)
+    if source_md5 is None:
+        data = await source.get_file(flow_id=namespace, file_name=file_name)
+        source_md5 = hashlib.md5(data).hexdigest()  # noqa: S324 - compared with S3's ETag, not a security use
+    if source_md5 != target_md5:
         reason = f"target holds an object of the same size ({size} bytes) with different content"
         return FilePlan("refuse", key, size, reason)
     return FilePlan("skip", key, size, "already in the target")
